@@ -2,7 +2,8 @@
 a work-in-progress k-mer counter written in Rust
 
 Usage
-rusty-k <k-mer size> <input file> [OPTIONS]
+
+    rusty-k <k-mer size> <input file> [OPTIONS]
 
 Options
 
@@ -16,16 +17,17 @@ Arguments
 
 Example
 
-rusty-k 21 input.fasta/fastq -o output.txt -t 4
+    rusty-k 21 input.fasta/fastq -o output.txt -t 4
 
 This command will count the canonical k-mers of size 21 in the input.fasta/fastq file using 4 threads and write the results to output.txt.
 
-Histogram
+# histogram
 
 The histogram script takes the output of the k-mer counting program and generates a histogram of k-mer frequencies, sorted numerically by the k-mer count.
 
 Usage
-bin/histogram [OPTIONS] <input file>
+
+    bin/histogram [OPTIONS] <input file>
 
 Options
 
@@ -38,7 +40,7 @@ Arguments
 
 Example
 
-bin/histogram input.txt -o histogram.txt -t 4
+    bin/histogram input.txt -o histogram.txt -t 4
 
 This command will read the k-mer counts from input.txt using 4 threads, create a histogram, sort it numerically, and write the sorted histogram to histogram.txt.
 
