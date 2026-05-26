@@ -1,7 +1,9 @@
 [package]
 name = "rusty-k"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
 xxhash-rust = { version = "0.8.6", features = ["xxh3"] }

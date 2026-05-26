@@ -1,46 +1,81 @@
 # rusty-k
-a work-in-progress k-mer counter written in Rust
 
-Usage
+A fast, parallel k-mer counter for DNA sequences written in Rust.
 
-    rusty-k <k-mer size> <input file> [OPTIONS]
+## Features
 
-Options
+- Counts canonical k-mers in FASTA/FASTQ files
+- Multi-threaded processing for large datasets
+- Generates frequency histograms
+- Proper error handling and validation
+- Unified CLI with subcommands
 
-    -o, --output: Specify the output file to write the k-mer counts. If not provided, the output will be printed to the console.
-    -t, --threads: Specify the number of threads to use for parallel processing. Default is 1.
+## Installation
 
-Arguments
+```bash
+cargo build --release
+```
 
-    <k-mer size>: The size of the k-mers to count (e.g., 21).
-    <input file>: The path to the input FASTA or FASTQ file containing the DNA sequences.
+The binary will be at `target/release/rusty-k`.
 
-Example
+## Usage
 
-    rusty-k 21 input.fasta/fastq -o output.txt -t 4
+### Count K-mers
 
-This command will count the canonical k-mers of size 21 in the input.fasta/fastq file using 4 threads and write the results to output.txt.
+Count canonical k-mers in a DNA sequence file:
 
-# histogram
+```bash
+rusty-k count <INPUT> --kmer-size <K> [-o OUTPUT] [-t THREADS]
+```
 
-The histogram script takes the output of the k-mer counting program and generates a histogram of k-mer frequencies, sorted numerically by the k-mer count.
+**Arguments:**
+- `INPUT`: Path to FASTA or FASTQ file
 
-Usage
+**Options:**
+- `-k, --kmer-size <SIZE>`: K-mer size (1-32, required)
+- `-o, --output <FILE>`: Output file (default: stdout)
+- `-t, --threads <NUM>`: Number of threads (default: 1)
 
-    bin/histogram [OPTIONS] <input file>
+**Example:**
+```bash
+rusty-k count input.fasta --kmer-size 21 -o counts.txt -t 4
+```
 
-Options
+### Generate Histogram
 
-    -o, --output: Specify the output file to write the histogram. If not provided, the histogram will be printed to the console.
-    -t, --threads: Specify the number of threads to use for parallel processing. Default is 1.
+Create a frequency histogram from k-mer counts:
 
-Arguments
+```bash
+rusty-k histogram <INPUT> [-o OUTPUT] [-t THREADS]
+```
 
-    <input file>: The path to the input file containing the k-mer counts (output from the main program).
+**Arguments:**
+- `INPUT`: Path to k-mer counts file (output from `count` command)
 
-Example
+**Options:**
+- `-o, --output <FILE>`: Output file (default: stdout)
+- `-t, --threads <NUM>`: Number of threads (default: 1)
 
-    bin/histogram input.txt -o histogram.txt -t 4
+**Example:**
+```bash
+rusty-k histogram counts.txt -o histogram.txt -t 4
+```
 
-This command will read the k-mer counts from input.txt using 4 threads, create a histogram, sort it numerically, and write the sorted histogram to histogram.txt.
+## Complete Workflow
+
+```bash
+# Count k-mers
+rusty-k count input.fasta --kmer-size 21 -o counts.txt -t 4
+
+# Generate histogram
+rusty-k histogram counts.txt -o histogram.txt
+```
+
+## Help
+
+```bash
+rusty-k --help
+rusty-k count --help
+rusty-k histogram --help
+```
 
