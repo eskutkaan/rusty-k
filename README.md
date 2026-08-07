@@ -1,81 +1,65 @@
 # rusty-k
 
-A fast, parallel k-mer counter for DNA sequences written in Rust.
+`rusty-k` is a fast Rust tool for k-mer counting and repeat analysis on genome assemblies.
 
-## Features
-
-- Counts canonical k-mers in FASTA/FASTQ files
-- Multi-threaded processing for large datasets
-- Generates frequency histograms
-- Proper error handling and validation
-- Unified CLI with subcommands
-
-## Installation
+## Install
 
 ```bash
 cargo build --release
 ```
 
-The binary will be at `target/release/rusty-k`.
+Binary: `target/release/rusty-k`
 
-## Usage
+## Commands
 
-### Count K-mers
-
-Count canonical k-mers in a DNA sequence file:
+### Count
 
 ```bash
-rusty-k count <INPUT> --kmer-size <K> [-o OUTPUT] [-t THREADS]
+rusty-k count input.fasta --kmer-size 21 -o counts.tsv -t 4
 ```
 
-**Arguments:**
-- `INPUT`: Path to FASTA or FASTQ file
+Counts canonical k-mers from FASTA or FASTQ.
 
-**Options:**
-- `-k, --kmer-size <SIZE>`: K-mer size (1-32, required)
-- `-o, --output <FILE>`: Output file (default: stdout)
-- `-t, --threads <NUM>`: Number of threads (default: 1)
-
-**Example:**
-```bash
-rusty-k count input.fasta --kmer-size 21 -o counts.txt -t 4
-```
-
-### Generate Histogram
-
-Create a frequency histogram from k-mer counts:
+### Histogram
 
 ```bash
-rusty-k histogram <INPUT> [-o OUTPUT] [-t THREADS]
+rusty-k histogram counts.tsv -o histogram.tsv -t 4
 ```
 
-**Arguments:**
-- `INPUT`: Path to k-mer counts file (output from `count` command)
+Builds a frequency histogram from k-mer counts.
 
-**Options:**
-- `-o, --output <FILE>`: Output file (default: stdout)
-- `-t, --threads <NUM>`: Number of threads (default: 1)
-
-**Example:**
-```bash
-rusty-k histogram counts.txt -o histogram.txt -t 4
-```
-
-## Complete Workflow
+### Repeat Candidates
 
 ```bash
-# Count k-mers
-rusty-k count input.fasta --kmer-size 21 -o counts.txt -t 4
-
-# Generate histogram
-rusty-k histogram counts.txt -o histogram.txt
+rusty-k repeatcandidates assembly.fasta --kmer-size 21 -m 2 -o repeats.bed -t 4
 ```
+
+Reports repeat candidates from an assembly in BED-like format.
+
+### Tandem
+
+```bash
+rusty-k tandem assembly.fasta --min-period 4 --max-period 50 -c 3 --min-length 12 --max-mismatches 1 -o tandem.tsv -t 4
+```
+
+Detects approximate tandem repeats. Default output is grouped by locus. Use `--raw` for call-level output.
+
+Grouped output columns: `contig`, `start`, `end`, `period`, `copies`, `mismatches`, `supporting_calls`, `consensus`
+
+Raw output columns: `contig`, `start`, `end`, `period`, `copies`, `mismatches`, `motif`, `consensus`
+
+### Benchmark
+
+```bash
+rusty-k benchmark assembly.fasta --min-k 15 --max-k 31 --step 2 --target-repeat-fraction 0.05 -m 2 -o benchmark.tsv -t 4
+```
+
+Sweeps k-mer sizes and recommends the first k whose repeat fraction falls at or below the target fraction.
 
 ## Help
 
 ```bash
 rusty-k --help
-rusty-k count --help
-rusty-k histogram --help
+rusty-k tandem --help
 ```
 
