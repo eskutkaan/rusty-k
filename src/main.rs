@@ -1,4 +1,4 @@
-//! kmer_tool – efficient k-mer counting, tandem-repeat detection,
+//! rusty-k – efficient k-mer counting, tandem-repeat detection,
 //! and repetitive-region calling for genome assemblies.
 
 mod kmer;
@@ -15,7 +15,7 @@ use crate::error::Result;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "kmer_tool",
+    name = "rusty-k",
     version,
     about = "K-mer counter with tandem-repeat and repetitive-region detection",
     long_about = None
@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Count k-mers in a FASTA/FASTQ assembly or read set
+    /// Count k-mers in an assembly or read set
     Count {
         /// Input FASTA/FASTQ (supports .gz)
         #[arg(short, long)]
