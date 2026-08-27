@@ -12,7 +12,7 @@ Designed for genome *assemblies* (contigs / scaffolds).
 
 ```bash
 cargo build --release
-# binary → target/release/kmer_tool
+# binary → target/release/rusty-k
 ```
 
 ## Sub-commands
@@ -20,14 +20,14 @@ cargo build --release
 ### `count` – k-mer frequencies
 
 ```bash
-kmer_tool count -k 21 -i assembly.fa -o kmers.tsv
-kmer_tool count -k 21 -i assembly.fa -o kmers.json --json --min-count 2
+rusty-k count -k 21 -i assembly.fa -o kmers.tsv
+rusty-k count -k 21 -i assembly.fa -o kmers.json --json --min-count 2
 ```
 
 ### `tandem` – tandem repeats
 
 ```bash
-kmer_tool tandem -k 11 -i assembly.fa --min-copies 3 --max-period 50 -o tandems.bed
+rusty-k tandem -k 11 -i assembly.fa --min-copies 3 --max-period 50 -o tandems.bed
 ```
 
 Output is BED6: `chrom  start  end  name  score  strand`  
@@ -36,7 +36,7 @@ where `name` encodes the period and copy number (e.g. `TR_period6_x12`).
 ### `repeats` – repetitive regions
 
 ```bash
-kmer_tool repeats -k 21 -i assembly.fa --min-count 5 --min-len 100 --merge-gap 50 \
+rusty-k repeats -k 21 -i assembly.fa --min-count 5 --min-len 100 --merge-gap 50 \
                   -o repeats.bed --coverage coverage.tsv
 ```
 
@@ -45,7 +45,7 @@ A position is marked repetitive when the k-mer that starts there (or any overlap
 ### `all` – run everything
 
 ```bash
-kmer_tool all -k 21 --tandem-k 11 -i assembly.fa -o results/
+rusty-k all -k 21 --tandem-k 11 -i assembly.fa -o results/
 ```
 
 Produces:
@@ -73,6 +73,6 @@ results/
 *E. coli* K-12 MG1655 complete genome (NC_000913.3, 4.64 Mb) is included under `test/`:
 
 ```bash
-./kmer_tool all -k 21 --tandem-k 11 \
+./rusty-k all -k 21 --tandem-k 11 \
     -i test/ecoli_MG1655.fna -o test/results
 ```
