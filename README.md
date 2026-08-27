@@ -1,65 +1,78 @@
 # rusty-k
 
-`rusty-k` is a fast Rust tool for k-mer counting and repeat analysis on genome assemblies.
+A fast, parallel Rust CLI for:
 
-## Install
+* **k-mer counting** (canonical, 2-bit packed, k ≤ 32)
+* **tandem-repeat detection** (exact periods 1–N bp)
+* **repetitive-region calling** from high-abundance k-mers
+
+Designed for genome *assemblies* (contigs / scaffolds). 
+
+## Build
 
 ```bash
 cargo build --release
+# binary → target/release/kmer_tool
 ```
 
-Binary: `target/release/rusty-k`
+## Sub-commands
 
-## Commands
-
-### Count
+### `count` – k-mer frequencies
 
 ```bash
-rusty-k count input.fasta --kmer-size 21 -o counts.tsv -t 4
+kmer_tool count -k 21 -i assembly.fa -o kmers.tsv
+kmer_tool count -k 21 -i assembly.fa -o kmers.json --json --min-count 2
 ```
 
-Counts canonical k-mers from FASTA or FASTQ.
-
-### Histogram
+### `tandem` – tandem repeats
 
 ```bash
-rusty-k histogram counts.tsv -o histogram.tsv -t 4
+kmer_tool tandem -k 11 -i assembly.fa --min-copies 3 --max-period 50 -o tandems.bed
 ```
 
-Builds a frequency histogram from k-mer counts.
+Output is BED6: `chrom  start  end  name  score  strand`  
+where `name` encodes the period and copy number (e.g. `TR_period6_x12`).
 
-### Repeat Candidates
+### `repeats` – repetitive regions
 
 ```bash
-rusty-k repeatcandidates assembly.fasta --kmer-size 21 -m 2 -o repeats.bed -t 4
+kmer_tool repeats -k 21 -i assembly.fa --min-count 5 --min-len 100 --merge-gap 50 \
+                  -o repeats.bed --coverage coverage.tsv
 ```
 
-Reports repeat candidates from an assembly in BED-like format.
+A position is marked repetitive when the k-mer that starts there (or any overlapping k-mer) has genome-wide count ≥ `min_count`.  Neighbouring high-coverage stretches separated by ≤ `merge_gap` bases are merged.
 
-### Tandem
+### `all` – run everything
 
 ```bash
-rusty-k tandem assembly.fasta --min-period 4 --max-period 50 -c 3 --min-length 12 --max-mismatches 1 -o tandem.tsv -t 4
+kmer_tool all -k 21 --tandem-k 11 -i assembly.fa -o results/
 ```
 
-Detects approximate tandem repeats. Default output is grouped by locus. Use `--raw` for call-level output.
+Produces:
 
-Grouped output columns: `contig`, `start`, `end`, `period`, `copies`, `mismatches`, `supporting_calls`, `consensus`
+```
+results/
+├── kmers.tsv
+├── tandems.bed
+├── repeats.bed
+└── summary.json
+```
 
-Raw output columns: `contig`, `start`, `end`, `period`, `copies`, `mismatches`, `motif`, `consensus`
+## Algorithm notes
 
-### Benchmark
+| Component | Method |
+|-----------|--------|
+| Encoding | 2-bit DNA, 64-bit integers, k ≤ 32 |
+| Canonical | `min(forward, reverse-complement)` |
+| Counting | Parallel per-contig hash maps (FxHash) → merge |
+| Tandem | Exact unit matching for every period 1…max_period; run-length collapse |
+| Repeats | Global k-mer counts → per-base coverage track → interval collapsing |
+
+## Test data
+
+*E. coli* K-12 MG1655 complete genome (NC_000913.3, 4.64 Mb) is included under `test/`:
 
 ```bash
-rusty-k benchmark assembly.fasta --min-k 15 --max-k 31 --step 2 --target-repeat-fraction 0.05 -m 2 -o benchmark.tsv -t 4
+./kmer_tool all -k 21 --tandem-k 11 \
+    -i test/ecoli_MG1655.fna -o test/results
 ```
-
-Sweeps k-mer sizes and recommends the first k whose repeat fraction falls at or below the target fraction.
-
-## Help
-
-```bash
-rusty-k --help
-rusty-k tandem --help
-```
-
