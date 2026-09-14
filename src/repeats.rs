@@ -10,13 +10,14 @@
 
 use crate::error::Result;
 use crate::io::BedInterval;
-use crate::kmer::{count_kmers, kmer_positions};
+use crate::kmer::{count_kmers, count_kmers_at_least, for_each_kmer_position};
 use fxhash::FxHashMap;
 use needletail::parse_fastx_file;
-use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::path::Path;
 
 /// Returns (BED intervals, optional per-contig coverage vectors).
+#[allow(dead_code)]
 pub fn detect_repeats(
     path: &Path,
     k: u8,
@@ -24,9 +25,43 @@ pub fn detect_repeats(
     min_len: u32,
     merge_gap: u32,
     canonical: bool,
+    collect_coverage: bool,
 ) -> Result<(Vec<BedInterval>, Vec<(String, Vec<u64>)>)> {
     let counts = count_kmers(path, k, canonical)?;
-    detect_repeats_with_counts(path, &counts, k, min_count, min_len, merge_gap, canonical)
+    detect_repeats_with_counts(
+        path,
+        &counts,
+        k,
+        min_count,
+        min_len,
+        merge_gap,
+        canonical,
+        collect_coverage,
+    )
+}
+
+/// Call repeats with a disk-backed threshold count table.
+pub fn detect_repeats_with_memory_budget(
+    path: &Path,
+    k: u8,
+    min_count: u64,
+    min_len: u32,
+    merge_gap: u32,
+    canonical: bool,
+    collect_coverage: bool,
+    max_memory_mb: usize,
+) -> Result<(Vec<BedInterval>, Vec<(String, Vec<u64>)>)> {
+    let counts = count_kmers_at_least(path, k, canonical, min_count, max_memory_mb)?;
+    detect_repeats_with_counts(
+        path,
+        &counts,
+        k,
+        min_count,
+        min_len,
+        merge_gap,
+        canonical,
+        collect_coverage,
+    )
 }
 
 /// Call repetitive regions using already computed global k-mer counts.
@@ -38,11 +73,12 @@ pub fn detect_repeats_with_counts(
     min_len: u32,
     merge_gap: u32,
     canonical: bool,
+    collect_coverage: bool,
 ) -> Result<(Vec<BedInterval>, Vec<(String, Vec<u64>)>)> {
-    // Load sequences
-    let mut records: Vec<(String, Vec<u8>)> = Vec::new();
     let mut reader =
         parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+    let mut all_ivs = Vec::new();
+    let mut all_cov = Vec::new();
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| crate::error::Error::Other(e.to_string()))?;
         let id = String::from_utf8_lossy(rec.id())
@@ -50,38 +86,120 @@ pub fn detect_repeats_with_counts(
             .next()
             .unwrap_or("")
             .to_string();
-        records.push((id, rec.seq().to_vec()));
-    }
-
-    let results: Vec<(Vec<BedInterval>, (String, Vec<u64>))> = records
-        .par_iter()
-        .map(|(id, seq)| {
-            let positions = kmer_positions(seq, k, canonical);
+        let seq = rec.seq();
+        if collect_coverage {
             let mut coverage = vec![0u64; seq.len()];
-
-            for &(pos, km) in &positions {
-                let c = *counts.get(&km).unwrap_or(&0);
-                // annotate the whole k-mer span
-                for p in pos..pos + k as usize {
-                    if p < coverage.len() {
-                        coverage[p] = coverage[p].max(c);
-                    }
-                }
-            }
-
-            let intervals = coverage_to_intervals(id, &coverage, min_count, min_len, merge_gap);
-            (intervals, (id.clone(), coverage))
-        })
-        .collect();
-
-    let mut all_ivs = Vec::new();
-    let mut all_cov = Vec::new();
-    for (ivs, cov) in results {
-        all_ivs.extend(ivs);
-        all_cov.push(cov);
+            stream_max_coverage(seq.as_ref(), k, canonical, counts, |pos, value| {
+                coverage[pos] = value;
+            });
+            all_ivs.extend(coverage_to_intervals(
+                &id, &coverage, min_count, min_len, merge_gap,
+            ));
+            all_cov.push((id, coverage));
+        } else {
+            all_ivs.extend(intervals_from_stream(
+                &id,
+                seq.as_ref(),
+                k,
+                canonical,
+                counts,
+                min_count,
+                min_len,
+                merge_gap,
+            ));
+        }
     }
     all_ivs.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.start.cmp(&b.start)));
     Ok((all_ivs, all_cov))
+}
+
+fn stream_max_coverage<F>(
+    seq: &[u8],
+    k: u8,
+    canonical: bool,
+    counts: &FxHashMap<u64, u64>,
+    mut emit: F,
+) where
+    F: FnMut(usize, u64),
+{
+    let mut active = BinaryHeap::new();
+    let mut cursor = 0usize;
+    for_each_kmer_position(seq, k, canonical, |start, value| {
+        for position in cursor..start {
+            while active.peek().is_some_and(|&(_, end)| end <= position) {
+                active.pop();
+            }
+            emit(position, active.peek().map_or(0, |&(count, _)| count));
+        }
+        while active.peek().is_some_and(|&(_, end)| end <= start) {
+            active.pop();
+        }
+        active.push((*counts.get(&value).unwrap_or(&0), start + k as usize));
+        emit(start, active.peek().map_or(0, |&(count, _)| count));
+        cursor = start + 1;
+    });
+    for position in cursor..seq.len() {
+        while active.peek().is_some_and(|&(_, end)| end <= position) {
+            active.pop();
+        }
+        emit(position, active.peek().map_or(0, |&(count, _)| count));
+    }
+}
+
+fn intervals_from_stream(
+    chrom: &str,
+    seq: &[u8],
+    k: u8,
+    canonical: bool,
+    counts: &FxHashMap<u64, u64>,
+    min_count: u64,
+    min_len: u32,
+    merge_gap: u32,
+) -> Vec<BedInterval> {
+    let mut intervals = Vec::new();
+    let mut current_start = None;
+    let mut current_end = 0usize;
+    let mut current_score = 0u64;
+    let mut last_high = None;
+    let mut emit = |position: usize, value: u64| {
+        if value >= min_count {
+            if current_start.is_none() {
+                current_start = Some(position);
+            }
+            current_end = position + 1;
+            current_score = current_score.max(value);
+            last_high = Some(position);
+        } else if let (Some(start), Some(last)) = (current_start, last_high) {
+            if position.saturating_sub(last) > merge_gap as usize {
+                if current_end - start >= min_len as usize {
+                    intervals.push(BedInterval {
+                        chrom: chrom.to_string(),
+                        start: start as u64,
+                        end: current_end as u64,
+                        name: "repetitive".into(),
+                        score: current_score,
+                        strand: ".",
+                    });
+                }
+                current_start = None;
+                current_score = 0;
+            }
+        }
+    };
+    stream_max_coverage(seq, k, canonical, counts, &mut emit);
+    if let Some(start) = current_start {
+        if current_end - start >= min_len as usize {
+            intervals.push(BedInterval {
+                chrom: chrom.to_string(),
+                start: start as u64,
+                end: current_end as u64,
+                name: "repetitive".into(),
+                score: current_score,
+                strand: ".",
+            });
+        }
+    }
+    intervals
 }
 
 fn coverage_to_intervals(

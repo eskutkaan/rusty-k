@@ -5,20 +5,139 @@
 
 use crate::error::Result;
 use crate::io::BedInterval;
+use crossbeam_channel::bounded;
 use needletail::parse_fastx_file;
-use rayon::prelude::*;
 use std::path::Path;
 
 /// Detect tandem repeats in a FASTA assembly.
+#[allow(dead_code)]
 pub fn detect_tandems(
     path: &Path,
     min_repeat_span: u32,
     min_copies: u32,
     max_period: u32,
 ) -> Result<Vec<BedInterval>> {
-    let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+    detect_tandems_with_threads(path, min_repeat_span, min_copies, max_period, 1)
+}
+
+pub fn detect_tandems_with_threads(
+    path: &Path,
+    min_repeat_span: u32,
+    min_copies: u32,
+    max_period: u32,
+    threads: usize,
+) -> Result<Vec<BedInterval>> {
+    let workers = threads.max(1);
+    if workers == 1 {
+        return detect_tandems_sequential(path, min_repeat_span, min_copies, max_period);
+    }
+
+    let (sender, receiver) = bounded::<TandemTask>(workers * 2);
+    let (result_sender, result_receiver) = bounded::<Vec<BedInterval>>(workers);
+    let mut parse_error = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let receiver = receiver.clone();
+            let result_sender = result_sender.clone();
+            scope.spawn(move || {
+                while let Ok(task) = receiver.recv() {
+                    let mut intervals = find_tandems_in_seq(
+                        &task.id,
+                        &task.sequence,
+                        min_repeat_span,
+                        min_copies,
+                        max_period,
+                    );
+                    intervals.retain(|interval| {
+                        let global_start = task.global_offset + interval.start as usize;
+                        global_start >= task.owned_start && global_start < task.owned_end
+                    });
+                    for interval in &mut intervals {
+                        interval.start += task.global_offset as u64;
+                        interval.end += task.global_offset as u64;
+                    }
+                    if result_sender.send(intervals).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(receiver);
+        drop(result_sender);
+
+        let mut reader =
+            match parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string())) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    parse_error = Some(error);
+                    drop(sender);
+                    return;
+                }
+            };
+        while let Some(rec) = reader.next() {
+            match rec {
+                Ok(rec) => {
+                    let id = String::from_utf8_lossy(rec.id())
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let seq = rec.seq();
+                    let chunk_size = 4 * 1024 * 1024;
+                    let overlap = (max_period as usize)
+                        .saturating_mul(min_copies.max(1) as usize)
+                        .max(min_repeat_span as usize);
+                    let mut chunk_start = 0usize;
+                    while chunk_start < seq.len() {
+                        let chunk_end = (chunk_start + chunk_size).min(seq.len());
+                        let left = chunk_start.saturating_sub(overlap);
+                        let right = (chunk_end + overlap).min(seq.len());
+                        let task = TandemTask {
+                            id: id.clone(),
+                            sequence: seq[left..right].to_vec(),
+                            global_offset: left,
+                            owned_start: chunk_start,
+                            owned_end: chunk_end,
+                        };
+                        if sender.send(task).is_err() {
+                            break;
+                        }
+                        chunk_start = chunk_end;
+                    }
+                }
+                Err(error) => {
+                    parse_error = Some(crate::error::Error::Other(error.to_string()));
+                    break;
+                }
+            }
+        }
+        drop(sender);
+    });
+
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
+    Ok(result_receiver.into_iter().flatten().collect())
+}
+
+struct TandemTask {
+    id: String,
+    sequence: Vec<u8>,
+    global_offset: usize,
+    owned_start: usize,
+    owned_end: usize,
+}
+
+fn detect_tandems_sequential(
+    path: &Path,
+    min_repeat_span: u32,
+    min_copies: u32,
+    max_period: u32,
+) -> Result<Vec<BedInterval>> {
     let mut reader =
         parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+    let mut all_intervals = Vec::new();
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| crate::error::Error::Other(e.to_string()))?;
         let id = String::from_utf8_lossy(rec.id())
@@ -26,15 +145,16 @@ pub fn detect_tandems(
             .next()
             .unwrap_or("")
             .to_string();
-        records.push((id, rec.seq().to_vec()));
+        all_intervals.extend(find_tandems_in_seq(
+            &id,
+            rec.seq().as_ref(),
+            min_repeat_span,
+            min_copies,
+            max_period,
+        ));
     }
 
-    let intervals: Vec<Vec<BedInterval>> = records
-        .par_iter()
-        .map(|(id, seq)| find_tandems_in_seq(id, seq, min_repeat_span, min_copies, max_period))
-        .collect();
-
-    Ok(intervals.into_iter().flatten().collect())
+    Ok(all_intervals)
 }
 
 fn find_tandems_in_seq(

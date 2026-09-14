@@ -38,6 +38,9 @@ enum Commands {
         json: bool,
         #[arg(long, default_value_t = 1)]
         min_count: u64,
+        /// Approximate RAM budget per disk-counting shard in MiB
+        #[arg(long, default_value_t = 4096)]
+        max_memory_mb: usize,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         canonical: bool,
         #[arg(short = 't', long, default_value_t = 0)]
@@ -70,6 +73,9 @@ enum Commands {
         merge_gap: u32,
         #[arg(short, long)]
         output: PathBuf,
+        /// Approximate RAM budget per disk-counting shard in MiB
+        #[arg(long, default_value_t = 4096)]
+        max_memory_mb: usize,
         #[arg(long)]
         coverage: Option<PathBuf>,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -86,12 +92,21 @@ enum Commands {
         tandem_k: u32,
         #[arg(short, long)]
         output: PathBuf,
+        /// Minimum count to include in kmers.tsv
+        #[arg(long, default_value_t = 1)]
+        kmer_min_count: u64,
+        /// Approximate RAM budget per disk-counting shard in MiB
+        #[arg(long, default_value_t = 4096)]
+        max_memory_mb: usize,
         #[arg(long, default_value_t = 5)]
         min_count: u64,
         #[arg(long, default_value_t = 3)]
         tandem_min_copies: u32,
         #[arg(long, default_value_t = 100)]
         max_period: u32,
+        /// Skip tandem-repeat detection in this pipeline
+        #[arg(long)]
+        skip_tandem: bool,
         #[arg(long, default_value_t = 100)]
         min_len: u32,
         #[arg(long, default_value_t = 50)]
@@ -124,11 +139,23 @@ fn main() -> Result<()> {
             output,
             json,
             min_count,
+            max_memory_mb,
             canonical,
             threads,
         } => {
             set_threads(threads);
-            let counts = kmer::count_kmers(&input, k, canonical)?;
+            let counts = if min_count > 1 {
+                kmer::count_kmers_at_least_with_threads(
+                    &input,
+                    k,
+                    canonical,
+                    min_count,
+                    max_memory_mb,
+                    threads,
+                )?
+            } else {
+                kmer::count_kmers_with_threads(&input, k, canonical, threads)?
+            };
             io::write_kmer_counts(&output, &counts, k, min_count, json)?;
             info!("Wrote {} distinct k-mers to {:?}", counts.len(), output);
         }
@@ -141,7 +168,8 @@ fn main() -> Result<()> {
             threads,
         } => {
             set_threads(threads);
-            let intervals = tandem::detect_tandems(&input, k, min_copies, max_period)?;
+            let intervals =
+                tandem::detect_tandems_with_threads(&input, k, min_copies, max_period, threads)?;
             io::write_bed(&output, &intervals)?;
             info!("Found {} tandem-repeat intervals", intervals.len());
         }
@@ -152,13 +180,22 @@ fn main() -> Result<()> {
             min_len,
             merge_gap,
             output,
+            max_memory_mb,
             coverage,
             canonical,
             threads,
         } => {
             set_threads(threads);
-            let (intervals, cov) =
-                repeats::detect_repeats(&input, k, min_count, min_len, merge_gap, canonical)?;
+            let (intervals, cov) = repeats::detect_repeats_with_memory_budget(
+                &input,
+                k,
+                min_count,
+                min_len,
+                merge_gap,
+                canonical,
+                coverage.is_some(),
+                max_memory_mb,
+            )?;
             io::write_bed(&output, &intervals)?;
             if let Some(path) = coverage {
                 io::write_coverage(&path, &cov)?;
@@ -170,9 +207,12 @@ fn main() -> Result<()> {
             k,
             tandem_k,
             output,
+            kmer_min_count,
+            max_memory_mb,
             min_count,
             tandem_min_copies,
             max_period,
+            skip_tandem,
             min_len,
             merge_gap,
             coverage,
@@ -181,13 +221,54 @@ fn main() -> Result<()> {
         } => {
             set_threads(threads);
             std::fs::create_dir_all(&output)?;
-            let counts = kmer::count_kmers(&input, k, canonical)?;
-            io::write_kmer_counts(&output.join("kmers.tsv"), &counts, k, 1, false)?;
-            let tandems = tandem::detect_tandems(&input, tandem_k, tandem_min_copies, max_period)?;
+            let counts = if kmer_min_count > 1 {
+                kmer::count_kmers_at_least_with_threads(
+                    &input,
+                    k,
+                    canonical,
+                    kmer_min_count,
+                    max_memory_mb,
+                    threads,
+                )?
+            } else {
+                kmer::count_kmers_with_threads(&input, k, canonical, threads)?
+            };
+            io::write_kmer_counts(&output.join("kmers.tsv"), &counts, k, kmer_min_count, false)?;
+            let tandems = if skip_tandem {
+                Vec::new()
+            } else {
+                tandem::detect_tandems_with_threads(
+                    &input,
+                    tandem_k,
+                    tandem_min_copies,
+                    max_period,
+                    threads,
+                )?
+            };
             io::write_bed(&output.join("tandems.bed"), &tandems)?;
-            let (reps, cov) = repeats::detect_repeats_with_counts(
-                &input, &counts, k, min_count, min_len, merge_gap, canonical,
-            )?;
+            let (reps, cov) = if kmer_min_count <= min_count {
+                repeats::detect_repeats_with_counts(
+                    &input,
+                    &counts,
+                    k,
+                    min_count,
+                    min_len,
+                    merge_gap,
+                    canonical,
+                    coverage.is_some(),
+                )?
+            } else {
+                repeats::detect_repeats_with_memory_budget(
+                    &input,
+                    k,
+                    min_count,
+                    min_len,
+                    merge_gap,
+                    canonical,
+                    coverage.is_some(),
+                    max_memory_mb,
+                )?
+            };
             io::write_bed(&output.join("repeats.bed"), &reps)?;
             if let Some(path) = coverage {
                 io::write_coverage(&path, &cov)?;
@@ -198,7 +279,10 @@ fn main() -> Result<()> {
                 "input": input_provenance(&input)?,
                 "threads": if threads == 0 { num_cpus::get() } else { threads },
                 "k": k,
+                "kmer_min_count": kmer_min_count,
+                "max_memory_mb": max_memory_mb,
                 "tandem_k": tandem_k,
+                "skip_tandem": skip_tandem,
                 "canonical": canonical,
                 "tandem_min_copies": tandem_min_copies,
                 "max_period": max_period,
@@ -221,11 +305,10 @@ fn main() -> Result<()> {
 
 fn set_threads(n: usize) {
     let n = if n == 0 { num_cpus::get() } else { n };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .build_global()
-        .ok();
-    info!("Using {} threads", n);
+    info!(
+        "Using up to {} record-processing workers; disk shard staging remains I/O-bound",
+        n
+    );
 }
 
 fn input_provenance(path: &std::path::Path) -> Result<serde_json::Value> {
