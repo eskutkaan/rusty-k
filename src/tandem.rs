@@ -1,8 +1,7 @@
 //! Tandem-repeat detection via periodogram of consecutive identical k-mers.
 //!
-//! For each contig we slide a window and look for stretches where the same
-//! k-mer (or a short period of k-mers) repeats at least `min_copies` times.
-//! Periods from 1 bp up to `max_period` are examined.
+//! For each contig we look for stretches where a nucleotide unit repeats at
+//! least `min_copies` times. Periods from 1 bp up to `max_period` are examined.
 
 use crate::error::Result;
 use crate::io::BedInterval;
@@ -13,21 +12,26 @@ use std::path::Path;
 /// Detect tandem repeats in a FASTA assembly.
 pub fn detect_tandems(
     path: &Path,
-    k: u8,
+    min_repeat_span: u32,
     min_copies: u32,
     max_period: u32,
 ) -> Result<Vec<BedInterval>> {
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut reader = parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+    let mut reader =
+        parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string()))?;
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| crate::error::Error::Other(e.to_string()))?;
-        let id = String::from_utf8_lossy(rec.id()).split_whitespace().next().unwrap_or("").to_string();
+        let id = String::from_utf8_lossy(rec.id())
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
         records.push((id, rec.seq().to_vec()));
     }
 
     let intervals: Vec<Vec<BedInterval>> = records
         .par_iter()
-        .map(|(id, seq)| find_tandems_in_seq(id, seq, k, min_copies, max_period))
+        .map(|(id, seq)| find_tandems_in_seq(id, seq, min_repeat_span, min_copies, max_period))
         .collect();
 
     Ok(intervals.into_iter().flatten().collect())
@@ -36,15 +40,11 @@ pub fn detect_tandems(
 fn find_tandems_in_seq(
     contig: &str,
     seq: &[u8],
-    k: u8,
+    min_repeat_span: u32,
     min_copies: u32,
     max_period: u32,
 ) -> Vec<BedInterval> {
     let n = seq.len();
-    if n < (k as usize) * (min_copies as usize) {
-        return Vec::new();
-    }
-
     let mut intervals = Vec::new();
     // We look for exact tandem repeats of unit length `period`.
     // For efficiency we only check periods that divide cleanly with the k-mer size
@@ -77,7 +77,8 @@ fn find_tandems_in_seq(
                     // partial – we still count the full copies
                 }
             }
-            if copies >= min_copies && copies > best_copies {
+            if copies >= min_copies && (pos - i) >= min_repeat_span as usize && copies > best_copies
+            {
                 best_copies = copies;
                 best_period = period as u32;
                 best_end = pos;
@@ -117,11 +118,13 @@ fn merge_intervals(mut ivs: Vec<BedInterval>) -> Vec<BedInterval> {
     let mut cur = ivs[0].clone();
     for next in ivs.into_iter().skip(1) {
         if next.chrom == cur.chrom && next.start <= cur.end + 10 {
+            let cur_len = cur.end - cur.start;
+            let next_len = next.end - next.start;
             // small gap allowed
             cur.end = cur.end.max(next.end);
             cur.score = cur.score.max(next.score);
             // keep the name of the longer one
-            if next.end - next.start > cur.end - cur.start {
+            if next_len > cur_len {
                 cur.name = next.name;
             }
         } else {
@@ -131,4 +134,24 @@ fn merge_intervals(mut ivs: Vec<BedInterval>) -> Vec<BedInterval> {
     }
     merged.push(cur);
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_exact_tandem_run() {
+        let intervals = find_tandems_in_seq("ctg", b"TTACACACGG", 6, 3, 10);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].start, 2);
+        assert_eq!(intervals[0].end, 8);
+        assert_eq!(intervals[0].name, "TR_period2_x3");
+    }
+
+    #[test]
+    fn minimum_repeat_span_is_enforced() {
+        let intervals = find_tandems_in_seq("ctg", b"ACACAC", 7, 3, 10);
+        assert!(intervals.is_empty());
+    }
 }

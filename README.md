@@ -30,6 +30,9 @@ rusty-k count -k 21 -i assembly.fa -o kmers.json --json --min-count 2
 rusty-k tandem -k 11 -i assembly.fa --min-copies 3 --max-period 50 -o tandems.bed
 ```
 
+For `tandem`, `-k` is the minimum total repeat span in bases. Periods from 1
+through `--max-period` are tested within that span threshold.
+
 Output is BED6: `chrom  start  end  name  score  strand`  
 where `name` encodes the period and copy number (e.g. `TR_period6_x12`).
 
@@ -68,7 +71,9 @@ results/
 ```
 
 When `--coverage` is provided, the requested TSV is written in addition to
-these files. `summary.json` records the thresholds used for the run.
+these files. `summary.json` records the thresholds used for the run and the
+input file's size and SHA-256 checksum. The `all` pipeline reuses its k-mer
+count table for repeat calling.
 
 ## Algorithm notes
 

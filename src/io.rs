@@ -20,7 +20,15 @@ pub struct BedInterval {
 
 pub fn write_bed(path: &Path, intervals: &[BedInterval]) -> Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
-    for iv in intervals {
+    let mut sorted = intervals.to_vec();
+    sorted.sort_by(|a, b| {
+        a.chrom
+            .cmp(&b.chrom)
+            .then(a.start.cmp(&b.start))
+            .then(a.end.cmp(&b.end))
+            .then(a.name.cmp(&b.name))
+    });
+    for iv in &sorted {
         writeln!(
             w,
             "{}\t{}\t{}\t{}\t{}\t{}",

@@ -125,7 +125,11 @@ pub fn kmer_positions(seq: &[u8], k: u8, canonical: bool) -> Vec<(usize, u64)> {
     let mut out = Vec::with_capacity(seq.len() - k as usize + 1);
     let mut current: u64 = 0;
     let mut valid = 0u8;
-    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mask = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
 
     for (i, &b) in seq.iter().enumerate() {
         match encode_base(b) {
@@ -150,4 +154,30 @@ pub fn kmer_positions(seq: &[u8], k: u8, canonical: bool) -> Vec<(usize, u64)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_ambiguous_bases() {
+        let kmers = extract_kmers(b"ACGTNACG", 3, false);
+        let decoded: Vec<_> = kmers.iter().map(|&km| decode_kmer(km, 3)).collect();
+        assert_eq!(decoded, ["ACG", "CGT", "ACG"]);
+    }
+
+    #[test]
+    fn canonical_count_collapses_reverse_complements() {
+        let forward = extract_kmers(b"ACG", 3, true);
+        let reverse = extract_kmers(b"CGT", 3, true);
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn supports_maximum_k() {
+        let kmers = extract_kmers(&[b'A'; 32], 32, false);
+        assert_eq!(kmers.len(), 1);
+        assert_eq!(decode_kmer(kmers[0], 32), "A".repeat(32));
+    }
 }

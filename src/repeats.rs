@@ -11,6 +11,7 @@
 use crate::error::Result;
 use crate::io::BedInterval;
 use crate::kmer::{count_kmers, kmer_positions};
+use fxhash::FxHashMap;
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
 use std::path::Path;
@@ -24,15 +25,31 @@ pub fn detect_repeats(
     merge_gap: u32,
     canonical: bool,
 ) -> Result<(Vec<BedInterval>, Vec<(String, Vec<u64>)>)> {
-    // Global k-mer counts
     let counts = count_kmers(path, k, canonical)?;
+    detect_repeats_with_counts(path, &counts, k, min_count, min_len, merge_gap, canonical)
+}
 
+/// Call repetitive regions using already computed global k-mer counts.
+pub fn detect_repeats_with_counts(
+    path: &Path,
+    counts: &FxHashMap<u64, u64>,
+    k: u8,
+    min_count: u64,
+    min_len: u32,
+    merge_gap: u32,
+    canonical: bool,
+) -> Result<(Vec<BedInterval>, Vec<(String, Vec<u64>)>)> {
     // Load sequences
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut reader = parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+    let mut reader =
+        parse_fastx_file(path).map_err(|e| crate::error::Error::Other(e.to_string()))?;
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| crate::error::Error::Other(e.to_string()))?;
-        let id = String::from_utf8_lossy(rec.id()).split_whitespace().next().unwrap_or("").to_string();
+        let id = String::from_utf8_lossy(rec.id())
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
         records.push((id, rec.seq().to_vec()));
     }
 
@@ -63,6 +80,7 @@ pub fn detect_repeats(
         all_ivs.extend(ivs);
         all_cov.push(cov);
     }
+    all_ivs.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.start.cmp(&b.start)));
     Ok((all_ivs, all_cov))
 }
 
@@ -122,4 +140,26 @@ fn coverage_to_intervals(
         });
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merges_short_gaps_and_keeps_peak_score() {
+        let coverage = [5, 5, 0, 5, 5];
+        let intervals = coverage_to_intervals("ctg", &coverage, 5, 4, 1);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].start, 0);
+        assert_eq!(intervals[0].end, 5);
+        assert_eq!(intervals[0].score, 5);
+    }
+
+    #[test]
+    fn filters_short_regions() {
+        let coverage = [5, 5, 0, 5, 5];
+        let intervals = coverage_to_intervals("ctg", &coverage, 5, 3, 0);
+        assert!(intervals.is_empty());
+    }
 }
