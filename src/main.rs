@@ -150,6 +150,26 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         min_count: u64,
 
+        /// Minimum number of tandem copies
+        #[arg(long, default_value_t = 3)]
+        tandem_min_copies: u32,
+
+        /// Maximum tandem-repeat period in bp
+        #[arg(long, default_value_t = 100)]
+        max_period: u32,
+
+        /// Minimum repetitive-region length in bp
+        #[arg(long, default_value_t = 100)]
+        min_len: u32,
+
+        /// Merge repetitive stretches separated by at most this many bases
+        #[arg(long, default_value_t = 50)]
+        merge_gap: u32,
+
+        /// Also write per-position repeat coverage to this TSV
+        #[arg(long)]
+        coverage: Option<PathBuf>,
+
         /// Number of threads
         #[arg(short = 't', long, default_value_t = 0)]
         threads: usize,
@@ -182,7 +202,7 @@ fn main() -> Result<()> {
             set_threads(threads);
             info!("Counting {}-mers from {:?}", k, input);
             let counts = kmer::count_kmers(&input, k, canonical)?;
-            io::write_kmer_counts(&output, &counts, min_count, json)?;
+            io::write_kmer_counts(&output, &counts, k, min_count, json)?;
             info!("Wrote {} distinct k-mers (min_count={}) to {:?}", counts.len(), min_count, output);
         }
 
@@ -230,6 +250,11 @@ fn main() -> Result<()> {
             tandem_k,
             output,
             min_count,
+            tandem_min_copies,
+            max_period,
+            min_len,
+            merge_gap,
+            coverage,
             threads,
         } => {
             set_threads(threads);
@@ -239,25 +264,36 @@ fn main() -> Result<()> {
             // 1. k-mer counts
             let counts = kmer::count_kmers(&input, k, true)?;
             let count_path = output.join("kmers.tsv");
-            io::write_kmer_counts(&count_path, &counts, 1, false)?;
+            io::write_kmer_counts(&count_path, &counts, k, 1, false)?;
             info!("K-mer counts → {:?}", count_path);
 
             // 2. tandem repeats
-            let tandems = tandem::detect_tandems(&input, tandem_k, 3, 100)?;
+            let tandems = tandem::detect_tandems(&input, tandem_k, tandem_min_copies, max_period)?;
             let tandem_path = output.join("tandems.bed");
             io::write_bed(&tandem_path, &tandems)?;
             info!("Tandem repeats → {:?}", tandem_path);
 
             // 3. repetitive regions
-            let (reps, _cov) = repeats::detect_repeats(&input, k, min_count, 100, 50, true)?;
+            let (reps, cov) = repeats::detect_repeats(
+                &input, k, min_count, min_len, merge_gap, true,
+            )?;
             let rep_path = output.join("repeats.bed");
             io::write_bed(&rep_path, &reps)?;
             info!("Repetitive regions → {:?}", rep_path);
+            if let Some(cov_path) = coverage {
+                io::write_coverage(&cov_path, &cov)?;
+                info!("Repeat coverage → {:?}", cov_path);
+            }
 
             // summary
             let summary = serde_json::json!({
                 "k": k,
                 "tandem_k": tandem_k,
+                "tandem_min_copies": tandem_min_copies,
+                "max_period": max_period,
+                "min_count": min_count,
+                "min_len": min_len,
+                "merge_gap": merge_gap,
                 "distinct_kmers": counts.len(),
                 "tandem_intervals": tandems.len(),
                 "repetitive_intervals": reps.len(),

@@ -48,6 +48,15 @@ A position is marked repetitive when the k-mer that starts there (or any overlap
 rusty-k all -k 21 --tandem-k 11 -i assembly.fa -o results/
 ```
 
+The `all` command accepts the same key thresholds used by the individual
+analyses, so a pipeline can be tuned without running separate commands:
+
+```bash
+rusty-k all -k 21 --tandem-k 11 --tandem-min-copies 4 --max-period 50 \
+    --min-count 8 --min-len 150 --merge-gap 25 --coverage results/coverage.tsv \
+    -i assembly.fa -o results/
+```
+
 Produces:
 
 ```
@@ -57,6 +66,9 @@ results/
 ├── repeats.bed
 └── summary.json
 ```
+
+When `--coverage` is provided, the requested TSV is written in addition to
+these files. `summary.json` records the thresholds used for the run.
 
 ## Algorithm notes
 
