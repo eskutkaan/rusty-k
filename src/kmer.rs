@@ -1,12 +1,13 @@
 //! Canonical k-mer encoding (k ≤ 32) and parallel counting.
 
 use crate::error::{Error, Result};
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Sender};
 use fxhash::FxHashMap;
 use needletail::parse_fastx_file;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 2-bit encoding: A=00, C=01, G=10, T=11.  Ambiguous bases are skipped.
@@ -23,6 +24,7 @@ fn encode_base(b: u8) -> Option<u64> {
 
 /// Reverse-complement a 2-bit encoded k-mer of length k.
 #[inline]
+#[allow(dead_code)]
 pub fn revcomp(kmer: u64, k: u8) -> u64 {
     let mut x = !kmer;
     // reverse the 2-bit chunks
@@ -53,6 +55,7 @@ pub fn extract_kmers(seq: &[u8], k: u8, canonical: bool) -> Vec<u64> {
     }
     let mut kmers = Vec::with_capacity(seq.len() - k as usize + 1);
     let mut current: u64 = 0;
+    let mut reverse: u64 = 0;
     let mut valid = 0u8;
     let mask = if k == 32 {
         u64::MAX
@@ -64,11 +67,11 @@ pub fn extract_kmers(seq: &[u8], k: u8, canonical: bool) -> Vec<u64> {
         match encode_base(b) {
             Some(bits) => {
                 current = ((current << 2) | bits) & mask;
+                reverse = (reverse >> 2) | ((3 - bits) << (2 * (k - 1)));
                 valid = valid.saturating_add(1);
                 if valid >= k {
                     let kmer = if canonical {
-                        let rc = revcomp(current, k);
-                        current.min(rc)
+                        current.min(reverse)
                     } else {
                         current
                     };
@@ -78,6 +81,7 @@ pub fn extract_kmers(seq: &[u8], k: u8, canonical: bool) -> Vec<u64> {
             None => {
                 valid = 0;
                 current = 0;
+                reverse = 0;
             }
         }
     }
@@ -85,6 +89,7 @@ pub fn extract_kmers(seq: &[u8], k: u8, canonical: bool) -> Vec<u64> {
 }
 
 /// Count k-mers across an entire FASTA/FASTQ file (parallel over records).
+#[allow(dead_code)]
 pub fn count_kmers(path: &Path, k: u8, canonical: bool) -> Result<FxHashMap<u64, u64>> {
     count_kmers_with_threads(path, k, canonical, 1)
 }
@@ -108,8 +113,17 @@ pub fn count_kmers_with_threads(
     let (sender, receiver) = bounded::<CountTask>(workers * 2);
     let (result_sender, result_receiver) = bounded::<FxHashMap<u64, u64>>(workers);
     let mut parse_error = None;
+    let mut global = None;
 
     std::thread::scope(|scope| {
+        let merger = scope.spawn(move || {
+            let mut global = FxHashMap::default();
+            for local in result_receiver {
+                merge_counts(&mut global, local);
+            }
+            global
+        });
+
         for _ in 0..workers {
             let receiver = receiver.clone();
             let result_sender = result_sender.clone();
@@ -125,53 +139,18 @@ pub fn count_kmers_with_threads(
         drop(receiver);
         drop(result_sender);
 
-        let mut reader = match parse_fastx_file(path).map_err(|e| Error::Other(e.to_string())) {
-            Ok(reader) => reader,
-            Err(error) => {
-                parse_error = Some(error);
-                drop(sender);
-                return;
-            }
-        };
-        while let Some(rec) = reader.next() {
-            match rec {
-                Ok(rec) => {
-                    let seq = rec.seq();
-                    let chunk_size = 4 * 1024 * 1024;
-                    let mut chunk_start = 0usize;
-                    while chunk_start < seq.len() {
-                        let chunk_end = (chunk_start + chunk_size).min(seq.len());
-                        let left = chunk_start.saturating_sub(k as usize - 1);
-                        let right = (chunk_end + k as usize - 1).min(seq.len());
-                        let task = CountTask {
-                            sequence: seq[left..right].to_vec(),
-                            global_offset: left,
-                            owned_start: chunk_start,
-                            owned_end: chunk_end,
-                        };
-                        if sender.send(task).is_err() {
-                            break;
-                        }
-                        chunk_start = chunk_end;
-                    }
-                }
-                Err(error) => {
-                    parse_error = Some(Error::Other(error.to_string()));
-                    break;
-                }
-            }
+        if let Err(error) = dispatch_tasks(path, k, DEFAULT_CHUNK_SIZE, &sender) {
+            parse_error = Some(error);
         }
         drop(sender);
+
+        global = Some(merger.join().expect("k-mer merger thread panicked"));
     });
 
     if let Some(error) = parse_error {
         return Err(error);
     }
-    let mut global = FxHashMap::default();
-    for local in result_receiver {
-        merge_counts(&mut global, local);
-    }
-    Ok(global)
+    Ok(global.expect("k-mer merger did not produce a result"))
 }
 
 fn count_kmers_sequential(path: &Path, k: u8, canonical: bool) -> Result<FxHashMap<u64, u64>> {
@@ -196,7 +175,9 @@ fn count_sequence(seq: &[u8], k: u8, canonical: bool) -> FxHashMap<u64, u64> {
 }
 
 struct CountTask {
-    sequence: Vec<u8>,
+    sequence: Arc<[u8]>,
+    sequence_start: usize,
+    sequence_end: usize,
     global_offset: usize,
     owned_start: usize,
     owned_end: usize,
@@ -204,12 +185,17 @@ struct CountTask {
 
 fn count_sequence_chunk(task: &CountTask, k: u8, canonical: bool) -> FxHashMap<u64, u64> {
     let mut counts = FxHashMap::default();
-    for_each_kmer_position(&task.sequence, k, canonical, |position, value| {
-        let global_position = task.global_offset + position;
-        if global_position >= task.owned_start && global_position < task.owned_end {
-            *counts.entry(value).or_insert(0) += 1;
-        }
-    });
+    for_each_kmer_position(
+        &task.sequence[task.sequence_start..task.sequence_end],
+        k,
+        canonical,
+        |position, value| {
+            let global_position = task.global_offset + position;
+            if global_position >= task.owned_start && global_position < task.owned_end {
+                *counts.entry(value).or_insert(0) += 1;
+            }
+        },
+    );
     counts
 }
 
@@ -222,8 +208,8 @@ fn merge_counts(target: &mut FxHashMap<u64, u64>, source: FxHashMap<u64, u64>) {
 /// Count only k-mers meeting `min_count`, using temporary hash shards on disk.
 ///
 /// This keeps the in-memory table bounded approximately by `max_memory_mb` per
-/// shard. It is intended for repeat calling, where low-abundance k-mers are
-/// irrelevant and retaining every distinct k-mer is prohibitively expensive.
+/// shard for large inputs where retaining every distinct k-mer is expensive.
+#[allow(dead_code)]
 pub fn count_kmers_at_least(
     path: &Path,
     k: u8,
@@ -255,28 +241,81 @@ pub fn count_kmers_at_least_with_threads(
     let target_entries = (memory_bytes / estimated_entry_bytes).max(1);
     let shard_count = ((bytes / target_entries).max(16) as usize).min(4096);
     let temp_dir = temporary_shard_dir()?;
-    let result = count_kmers_from_shards(
+    let result = stage_kmers_to_shards(
         path,
         k,
         canonical,
-        min_count,
         shard_count,
         &temp_dir,
+        max_memory_mb,
         threads,
     );
+    let result = result.and_then(|()| {
+        let mut retained = FxHashMap::default();
+        for_each_shard_count(&temp_dir, shard_count, min_count, |value, count| {
+            retained.insert(value, count);
+            Ok(())
+        })?;
+        Ok(retained)
+    });
     let _ = fs::remove_dir_all(&temp_dir);
     result
 }
 
-fn count_kmers_from_shards(
+/// Count k-mers with bounded memory and visit each final count as it is reduced.
+pub fn count_kmers_streaming<F>(
     path: &Path,
     k: u8,
     canonical: bool,
     min_count: u64,
+    max_memory_mb: usize,
+    threads: usize,
+    mut visit: F,
+) -> Result<u64>
+where
+    F: FnMut(u64, u64) -> Result<()>,
+{
+    if k == 0 || k > 32 {
+        return Err(Error::InvalidK(k));
+    }
+
+    let bytes = fs::metadata(path)?.len().max(1);
+    let memory_bytes = (max_memory_mb.max(1) as u64) * 1024 * 1024;
+    let estimated_entry_bytes = 40u64;
+    let target_entries = (memory_bytes / estimated_entry_bytes).max(1);
+    let shard_count = ((bytes / target_entries).max(16) as usize).min(4096);
+    let temp_dir = temporary_shard_dir()?;
+    let result = stage_kmers_to_shards(
+        path,
+        k,
+        canonical,
+        shard_count,
+        &temp_dir,
+        max_memory_mb,
+        threads,
+    )
+    .and_then(|()| {
+        let mut written = 0;
+        for_each_shard_count(&temp_dir, shard_count, min_count, |value, count| {
+            visit(value, count)?;
+            written += 1;
+            Ok(())
+        })?;
+        Ok(written)
+    });
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+fn stage_kmers_to_shards(
+    path: &Path,
+    k: u8,
+    canonical: bool,
     shard_count: usize,
     temp_dir: &Path,
+    max_memory_mb: usize,
     threads: usize,
-) -> Result<FxHashMap<u64, u64>> {
+) -> Result<()> {
     let workers = threads.max(1);
     let mut writers = Vec::with_capacity(shard_count);
     for shard in 0..shard_count {
@@ -325,41 +364,9 @@ fn count_kmers_from_shards(
         drop(task_receiver);
         drop(map_sender);
 
-        let mut reader = match parse_fastx_file(path).map_err(|e| Error::Other(e.to_string())) {
-            Ok(reader) => reader,
-            Err(error) => {
-                parse_error = Some(error);
-                drop(task_sender);
-                return;
-            }
-        };
-        while let Some(rec) = reader.next() {
-            match rec {
-                Ok(rec) => {
-                    let seq = rec.seq();
-                    let chunk_size = 4 * 1024 * 1024;
-                    let mut chunk_start = 0usize;
-                    while chunk_start < seq.len() {
-                        let chunk_end = (chunk_start + chunk_size).min(seq.len());
-                        let left = chunk_start.saturating_sub(k as usize - 1);
-                        let right = (chunk_end + k as usize - 1).min(seq.len());
-                        let task = CountTask {
-                            sequence: seq[left..right].to_vec(),
-                            global_offset: left,
-                            owned_start: chunk_start,
-                            owned_end: chunk_end,
-                        };
-                        if task_sender.send(task).is_err() {
-                            break;
-                        }
-                        chunk_start = chunk_end;
-                    }
-                }
-                Err(error) => {
-                    parse_error = Some(Error::Other(error.to_string()));
-                    break;
-                }
-            }
+        let chunk_size = chunk_size_for_memory(max_memory_mb, workers);
+        if let Err(error) = dispatch_tasks(path, k, chunk_size, &task_sender) {
+            parse_error = Some(error);
         }
         drop(task_sender);
         if let Err(error) = merger.join().expect("shard merger thread panicked") {
@@ -374,7 +381,18 @@ fn count_kmers_from_shards(
         return Err(error);
     }
 
-    let mut retained = FxHashMap::default();
+    Ok(())
+}
+
+fn for_each_shard_count<F>(
+    temp_dir: &Path,
+    shard_count: usize,
+    min_count: u64,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(u64, u64) -> Result<()>,
+{
     for shard in 0..shard_count {
         let path = temp_dir.join(format!("shard-{shard:04}.bin"));
         let file = File::open(path)?;
@@ -394,11 +412,147 @@ fn count_kmers_from_shards(
         }
         for (value, count) in counts {
             if count >= min_count {
-                retained.insert(value, count);
+                visit(value, count)?;
             }
         }
     }
-    Ok(retained)
+    Ok(())
+}
+
+const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+fn chunk_size_for_memory(max_memory_mb: usize, workers: usize) -> usize {
+    let memory_per_worker =
+        (max_memory_mb.max(1) as u64 * 1024 * 1024).saturating_div(workers.max(1) as u64);
+    let estimated_entries = (memory_per_worker / 40).max(64 * 1024);
+    estimated_entries.min(DEFAULT_CHUNK_SIZE as u64) as usize
+}
+
+fn dispatch_tasks(path: &Path, k: u8, chunk_size: usize, sender: &Sender<CountTask>) -> Result<()> {
+    let mut probe = File::open(path)?;
+    let mut first = [0u8; 1];
+    probe.read_exact(&mut first)?;
+    if first[0] == b'>' {
+        dispatch_fasta_tasks(path, k, chunk_size, sender)
+    } else {
+        let mut reader = parse_fastx_file(path).map_err(|e| Error::Other(e.to_string()))?;
+        while let Some(rec) = reader.next() {
+            let rec = rec.map_err(|e| Error::Other(e.to_string()))?;
+            let sequence: Arc<[u8]> = rec.seq().into_owned().into();
+            let mut chunk_start = 0usize;
+            while chunk_start < sequence.len() {
+                let chunk_end = (chunk_start + chunk_size).min(sequence.len());
+                let left = chunk_start.saturating_sub(k as usize - 1);
+                let right = (chunk_end + k as usize - 1).min(sequence.len());
+                sender
+                    .send(CountTask {
+                        sequence: Arc::clone(&sequence),
+                        sequence_start: left,
+                        sequence_end: right,
+                        global_offset: left,
+                        owned_start: chunk_start,
+                        owned_end: chunk_end,
+                    })
+                    .map_err(|_| Error::Other("worker channel closed".into()))?;
+                chunk_start = chunk_end;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn dispatch_fasta_tasks(
+    path: &Path,
+    k: u8,
+    chunk_size: usize,
+    sender: &Sender<CountTask>,
+) -> Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    let mut sequence = Vec::new();
+    let mut has_overlap = false;
+    let mut first_line = true;
+
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            send_fasta_sequence(&mut sequence, &mut has_overlap, k, chunk_size, sender)?;
+            return Ok(());
+        }
+        if first_line {
+            if line.first() != Some(&b'>') {
+                return Err(Error::Other("invalid FASTA header".into()));
+            }
+            first_line = false;
+            continue;
+        }
+        if line.first() == Some(&b'>') {
+            send_fasta_sequence(&mut sequence, &mut has_overlap, k, chunk_size, sender)?;
+            continue;
+        }
+        sequence.extend(
+            line.iter()
+                .copied()
+                .filter(|base| *base != b'\r' && *base != b'\n'),
+        );
+        send_fasta_full_chunks(&mut sequence, &mut has_overlap, k, chunk_size, sender)?;
+    }
+}
+
+fn send_fasta_full_chunks(
+    sequence: &mut Vec<u8>,
+    has_overlap: &mut bool,
+    k: u8,
+    chunk_size: usize,
+    sender: &Sender<CountTask>,
+) -> Result<()> {
+    let overlap = k as usize - 1;
+    let target = chunk_size + overlap;
+    while sequence.len() >= target {
+        let task_sequence: Arc<[u8]> = Arc::from(sequence[..target].to_vec());
+        sender
+            .send(CountTask {
+                sequence: task_sequence,
+                sequence_start: 0,
+                sequence_end: target,
+                global_offset: 0,
+                owned_start: 0,
+                owned_end: chunk_size,
+            })
+            .map_err(|_| Error::Other("worker channel closed".into()))?;
+        *sequence = sequence[target - overlap..].to_vec();
+        *has_overlap = true;
+    }
+    Ok(())
+}
+
+fn send_fasta_sequence(
+    sequence: &mut Vec<u8>,
+    has_overlap: &mut bool,
+    k: u8,
+    chunk_size: usize,
+    sender: &Sender<CountTask>,
+) -> Result<()> {
+    send_fasta_full_chunks(sequence, has_overlap, k, chunk_size, sender)?;
+    if sequence.len() > k as usize - 1 {
+        let end = sequence.len();
+        let overlap = k as usize - 1;
+        let task_sequence: Arc<[u8]> = Arc::from(std::mem::take(sequence));
+        sender
+            .send(CountTask {
+                sequence: task_sequence,
+                sequence_start: 0,
+                sequence_end: end,
+                global_offset: 0,
+                owned_start: 0,
+                owned_end: if *has_overlap { end - overlap } else { end },
+            })
+            .map_err(|_| Error::Other("worker channel closed".into()))?;
+    } else {
+        sequence.clear();
+    }
+    *has_overlap = false;
+    Ok(())
 }
 
 fn shard_index(value: u64, shard_count: usize) -> usize {
@@ -433,6 +587,7 @@ where
         return;
     }
     let mut current: u64 = 0;
+    let mut reverse: u64 = 0;
     let mut valid = 0u8;
     let mask = if k == 32 {
         u64::MAX
@@ -444,12 +599,12 @@ where
         match encode_base(b) {
             Some(bits) => {
                 current = ((current << 2) | bits) & mask;
+                reverse = (reverse >> 2) | ((3 - bits) << (2 * (k - 1)));
                 valid = valid.saturating_add(1);
                 if valid >= k {
                     let pos = i + 1 - k as usize;
                     let kmer = if canonical {
-                        let rc = revcomp(current, k);
-                        current.min(rc)
+                        current.min(reverse)
                     } else {
                         current
                     };
@@ -459,6 +614,7 @@ where
             None => {
                 valid = 0;
                 current = 0;
+                reverse = 0;
             }
         }
     }
@@ -498,6 +654,39 @@ mod tests {
             .filter(|(_, count)| *count >= 100)
             .collect();
         let actual = count_kmers_at_least(path, 5, true, 100, 1).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parallel_counter_handles_multiple_large_chunks() {
+        let path =
+            std::env::temp_dir().join(format!("rusty-k-large-test-{}.fa", std::process::id()));
+        let mut sequence = Vec::with_capacity(12 * 1024 * 1024);
+        for _ in 0..(3 * 1024 * 1024) {
+            sequence.extend_from_slice(b"ACGT");
+        }
+        let mut fasta = b">large\n".to_vec();
+        fasta.extend_from_slice(&sequence);
+        std::fs::write(&path, fasta).unwrap();
+
+        let single = count_kmers_with_threads(&path, 31, true, 1).unwrap();
+        let parallel = count_kmers_with_threads(&path, 31, true, 2).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(parallel, single);
+    }
+
+    #[test]
+    fn streaming_counter_matches_memory_counter() {
+        let path = std::path::Path::new("test/ecoli_MG1655.fna");
+        let expected = count_kmers_with_threads(path, 7, true, 1).unwrap();
+        let mut actual = FxHashMap::default();
+        let written = count_kmers_streaming(path, 7, true, 1, 1, 2, |value, count| {
+            actual.insert(value, count);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(written, expected.len() as u64);
         assert_eq!(actual, expected);
     }
 }

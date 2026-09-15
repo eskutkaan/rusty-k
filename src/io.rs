@@ -1,88 +1,56 @@
-//! Input / output helpers (BED, TSV, JSON, coverage).
+//! Streaming k-mer count output helpers.
 
 use crate::error::Result;
 use crate::kmer::decode_kmer;
-use fxhash::FxHashMap;
-use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-#[derive(Clone, Debug, Serialize)]
-pub struct BedInterval {
-    pub chrom: String,
-    pub start: u64,
-    pub end: u64,
-    pub name: String,
-    pub score: u64,
-    pub strand: &'static str,
-}
-
-pub fn write_bed(path: &Path, intervals: &[BedInterval]) -> Result<()> {
-    let mut w = BufWriter::new(File::create(path)?);
-    let mut sorted = intervals.to_vec();
-    sorted.sort_by(|a, b| {
-        a.chrom
-            .cmp(&b.chrom)
-            .then(a.start.cmp(&b.start))
-            .then(a.end.cmp(&b.end))
-            .then(a.name.cmp(&b.name))
-    });
-    for iv in &sorted {
-        writeln!(
-            w,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            iv.chrom, iv.start, iv.end, iv.name, iv.score, iv.strand
-        )?;
-    }
-    Ok(())
-}
-
-pub fn write_kmer_counts(
-    path: &Path,
-    counts: &FxHashMap<u64, u64>,
+pub struct KmerWriter {
+    writer: BufWriter<File>,
     k: u8,
-    min_count: u64,
     as_json: bool,
-) -> Result<()> {
-    let mut pairs: Vec<(u64, u64)> = counts
-        .iter()
-        .filter(|(_, &c)| c >= min_count)
-        .map(|(&k, &c)| (k, c))
-        .collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-    if as_json {
-        let objs: Vec<_> = pairs
-            .iter()
-            .map(|(km, c)| {
-                serde_json::json!({
-                    "kmer": decode_kmer(*km, k),
-                    "count": c
-                })
-            })
-            .collect();
-        let f = File::create(path)?;
-        serde_json::to_writer_pretty(f, &objs)?;
-    } else {
-        let mut w = BufWriter::new(File::create(path)?);
-        writeln!(w, "kmer\tcount")?;
-        for (km, c) in pairs {
-            writeln!(w, "{}\t{}", decode_kmer(km, k), c)?;
-        }
-    }
-    Ok(())
+    first: bool,
 }
 
-pub fn write_coverage(path: &Path, cov: &[(String, Vec<u64>)]) -> Result<()> {
-    let mut w = BufWriter::new(File::create(path)?);
-    writeln!(w, "contig\tposition\tcoverage")?;
-    for (id, v) in cov {
-        for (i, &c) in v.iter().enumerate() {
-            if c > 0 {
-                writeln!(w, "{}\t{}\t{}", id, i, c)?;
-            }
+impl KmerWriter {
+    pub fn create(path: &Path, k: u8, as_json: bool) -> Result<Self> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        if as_json {
+            write!(writer, "[")?;
+        } else {
+            writeln!(writer, "kmer\tcount")?;
         }
+        Ok(Self {
+            writer,
+            k,
+            as_json,
+            first: true,
+        })
     }
-    Ok(())
+
+    pub fn write_count(&mut self, kmer: u64, count: u64) -> Result<()> {
+        if self.as_json {
+            if !self.first {
+                write!(self.writer, ",")?;
+            }
+            write!(
+                self.writer,
+                "{{\"kmer\":\"{}\",\"count\":{}}}",
+                decode_kmer(kmer, self.k),
+                count
+            )?;
+        } else {
+            writeln!(self.writer, "{}\t{}", decode_kmer(kmer, self.k), count)?;
+        }
+        self.first = false;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        if self.as_json {
+            writeln!(self.writer, "]")?;
+        }
+        Ok(())
+    }
 }
