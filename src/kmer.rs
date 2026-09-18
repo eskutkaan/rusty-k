@@ -26,18 +26,20 @@ fn encode_base(b: u8) -> Option<u64> {
 #[inline]
 #[allow(dead_code)]
 pub fn revcomp(kmer: u64, k: u8) -> u64 {
+    assert!((1..=32).contains(&k), "k must be between 1 and 32");
     let mut x = !kmer;
     // reverse the 2-bit chunks
     x = ((x >> 2) & 0x3333_3333_3333_3333) | ((x & 0x3333_3333_3333_3333) << 2);
     x = ((x >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((x & 0x0F0F_0F0F_0F0F_0F0F) << 4);
     x = ((x >> 8) & 0x00FF_00FF_00FF_00FF) | ((x & 0x00FF_00FF_00FF_00FF) << 8);
     x = ((x >> 16) & 0x0000_FFFF_0000_FFFF) | ((x & 0x0000_FFFF_0000_FFFF) << 16);
-    x = (x >> 32) | (x << 32);
+    x = x.rotate_left(32);
     x >> (64 - 2 * k as u64)
 }
 
 /// Decode a 2-bit k-mer back to an ASCII string (for output).
 pub fn decode_kmer(kmer: u64, k: u8) -> String {
+    assert!((1..=32).contains(&k), "k must be between 1 and 32");
     const LUT: [u8; 4] = [b'A', b'C', b'G', b'T'];
     let mut s = vec![0u8; k as usize];
     for i in 0..k {
@@ -50,6 +52,7 @@ pub fn decode_kmer(kmer: u64, k: u8) -> String {
 /// Extract all valid k-mers from a sequence, optionally canonicalised.
 #[allow(dead_code)]
 pub fn extract_kmers(seq: &[u8], k: u8, canonical: bool) -> Vec<u64> {
+    assert!((1..=32).contains(&k), "k must be between 1 and 32");
     if seq.len() < k as usize {
         return Vec::new();
     }
@@ -231,16 +234,13 @@ pub fn count_kmers_at_least_with_threads(
     if k == 0 || k > 32 {
         return Err(Error::InvalidK(k));
     }
-    if min_count <= 1 {
-        return count_kmers_with_threads(path, k, canonical, threads);
-    }
 
     let bytes = fs::metadata(path)?.len().max(1);
     let memory_bytes = (max_memory_mb.max(1) as u64) * 1024 * 1024;
     let estimated_entry_bytes = 40u64;
     let target_entries = (memory_bytes / estimated_entry_bytes).max(1);
     let shard_count = ((bytes / target_entries).max(16) as usize).min(4096);
-    let temp_dir = temporary_shard_dir()?;
+    let temp_dir = temporary_shard_dir(None)?;
     let result = stage_kmers_to_shards(
         path,
         k,
@@ -252,10 +252,16 @@ pub fn count_kmers_at_least_with_threads(
     );
     let result = result.and_then(|()| {
         let mut retained = FxHashMap::default();
-        for_each_shard_count(&temp_dir, shard_count, min_count, |value, count| {
-            retained.insert(value, count);
-            Ok(())
-        })?;
+        for_each_shard_count(
+            &temp_dir,
+            shard_count,
+            min_count,
+            max_memory_mb,
+            |value, count| {
+                retained.insert(value, count);
+                Ok(())
+            },
+        )?;
         Ok(retained)
     });
     let _ = fs::remove_dir_all(&temp_dir);
@@ -263,6 +269,7 @@ pub fn count_kmers_at_least_with_threads(
 }
 
 /// Count k-mers with bounded memory and visit each final count as it is reduced.
+#[allow(dead_code)]
 pub fn count_kmers_streaming<F>(
     path: &Path,
     k: u8,
@@ -270,6 +277,32 @@ pub fn count_kmers_streaming<F>(
     min_count: u64,
     max_memory_mb: usize,
     threads: usize,
+    visit: F,
+) -> Result<u64>
+where
+    F: FnMut(u64, u64) -> Result<()>,
+{
+    count_kmers_streaming_with_temp_dir(
+        path,
+        k,
+        canonical,
+        min_count,
+        max_memory_mb,
+        threads,
+        None,
+        visit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn count_kmers_streaming_with_temp_dir<F>(
+    path: &Path,
+    k: u8,
+    canonical: bool,
+    min_count: u64,
+    max_memory_mb: usize,
+    threads: usize,
+    temp_parent: Option<&Path>,
     mut visit: F,
 ) -> Result<u64>
 where
@@ -284,7 +317,7 @@ where
     let estimated_entry_bytes = 40u64;
     let target_entries = (memory_bytes / estimated_entry_bytes).max(1);
     let shard_count = ((bytes / target_entries).max(16) as usize).min(4096);
-    let temp_dir = temporary_shard_dir()?;
+    let temp_dir = temporary_shard_dir(temp_parent)?;
     let result = stage_kmers_to_shards(
         path,
         k,
@@ -296,11 +329,17 @@ where
     )
     .and_then(|()| {
         let mut written = 0;
-        for_each_shard_count(&temp_dir, shard_count, min_count, |value, count| {
-            visit(value, count)?;
-            written += 1;
-            Ok(())
-        })?;
+        for_each_shard_count(
+            &temp_dir,
+            shard_count,
+            min_count,
+            max_memory_mb,
+            |value, count| {
+                visit(value, count)?;
+                written += 1;
+                Ok(())
+            },
+        )?;
         Ok(written)
     });
     let _ = fs::remove_dir_all(&temp_dir);
@@ -388,32 +427,106 @@ fn for_each_shard_count<F>(
     temp_dir: &Path,
     shard_count: usize,
     min_count: u64,
+    max_memory_mb: usize,
     mut visit: F,
 ) -> Result<()>
 where
     F: FnMut(u64, u64) -> Result<()>,
 {
+    let memory_bytes = (max_memory_mb.max(1) as u64) * 1024 * 1024;
+    let target_entries = (memory_bytes / 40).max(1) as usize;
     for shard in 0..shard_count {
         let path = temp_dir.join(format!("shard-{shard:04}.bin"));
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut counts = FxHashMap::default();
-        let mut bytes = [0u8; 16];
-        loop {
-            match reader.read_exact(&mut bytes) {
-                Ok(()) => {
-                    let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                    let count = u64::from_le_bytes(bytes[8..].try_into().unwrap());
-                    *counts.entry(value).or_insert(0) += count;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.into()),
-            }
+        reduce_shard(&path, min_count, target_entries, 0, &mut visit)?;
+    }
+    Ok(())
+}
+
+fn reduce_shard<F>(
+    path: &Path,
+    min_count: u64,
+    target_entries: usize,
+    depth: usize,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u64, u64) -> Result<()>,
+{
+    let record_count = fs::metadata(path)?.len() / 16;
+    if record_count as usize > target_entries {
+        if depth >= 16 {
+            return Err(Error::Other(
+                "unable to partition an oversized shard".into(),
+            ));
         }
-        for (value, count) in counts {
-            if count >= min_count {
-                visit(value, count)?;
+        let partition_dir = path.with_extension(format!("part-{depth}"));
+        fs::create_dir(&partition_dir)?;
+        let mut writers = Vec::with_capacity(16);
+        for partition in 0..16 {
+            let file = File::create(partition_dir.join(format!("{partition:02}.bin")))?;
+            writers.push(BufWriter::new(file));
+        }
+
+        let result = (|| -> Result<()> {
+            let mut reader = BufReader::new(File::open(path)?);
+            let mut value_bytes = [0u8; 8];
+            loop {
+                match reader.read_exact(&mut value_bytes) {
+                    Ok(()) => {
+                        let mut count_bytes = [0u8; 8];
+                        reader.read_exact(&mut count_bytes)?;
+                        let value = u64::from_le_bytes(value_bytes);
+                        let partition = shard_index(value, 16);
+                        writers[partition].write_all(&value.to_le_bytes())?;
+                        writers[partition].write_all(&count_bytes)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(error.into()),
+                }
             }
+            for writer in &mut writers {
+                writer.flush()?;
+            }
+            Ok(())
+        })();
+        drop(writers);
+        result?;
+
+        for partition in 0..16 {
+            reduce_shard(
+                &partition_dir.join(format!("{partition:02}.bin")),
+                min_count,
+                target_entries,
+                depth + 1,
+                visit,
+            )?;
+        }
+        fs::remove_dir_all(partition_dir)?;
+        return Ok(());
+    }
+
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut counts = FxHashMap::default();
+    let mut value_bytes = [0u8; 8];
+    loop {
+        match reader.read_exact(&mut value_bytes) {
+            Ok(()) => {
+                let mut count_bytes = [0u8; 8];
+                reader.read_exact(&mut count_bytes)?;
+                let value = u64::from_le_bytes(value_bytes);
+                let count = u64::from_le_bytes(count_bytes);
+                let total = counts.entry(value).or_insert(0u64);
+                *total = (*total).checked_add(count).ok_or_else(|| {
+                    Error::Other("k-mer count overflow during shard reduction".into())
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for (value, count) in counts {
+        if count >= min_count {
+            visit(value, count)?;
         }
     }
     Ok(())
@@ -431,7 +544,11 @@ fn chunk_size_for_memory(max_memory_mb: usize, workers: usize) -> usize {
 fn dispatch_tasks(path: &Path, k: u8, chunk_size: usize, sender: &Sender<CountTask>) -> Result<()> {
     let mut probe = File::open(path)?;
     let mut first = [0u8; 1];
-    probe.read_exact(&mut first)?;
+    match probe.read_exact(&mut first) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     if first[0] == b'>' {
         dispatch_fasta_tasks(path, k, chunk_size, sender)
     } else {
@@ -560,12 +677,20 @@ fn shard_index(value: u64, shard_count: usize) -> usize {
     (mixed as usize) % shard_count
 }
 
-fn temporary_shard_dir() -> Result<PathBuf> {
+fn temporary_shard_dir(temp_parent: Option<&Path>) -> Result<PathBuf> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::Other(e.to_string()))?
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("rusty-k-{}-{stamp}", std::process::id()));
+    let parent = match temp_parent {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| Error::Other("executable has no parent directory".into()))?
+            .join("tmp"),
+    };
+    fs::create_dir_all(&parent)?;
+    let path = parent.join(format!("rusty-k-{}-{stamp}", std::process::id()));
     fs::create_dir(&path)?;
     Ok(path)
 }
@@ -583,6 +708,7 @@ pub fn for_each_kmer_position<F>(seq: &[u8], k: u8, canonical: bool, mut visit: 
 where
     F: FnMut(usize, u64),
 {
+    assert!((1..=32).contains(&k), "k must be between 1 and 32");
     if seq.len() < k as usize {
         return;
     }

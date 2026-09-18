@@ -18,6 +18,20 @@ cargo build --release
     --threads 0
 ```
 
+Temporary shard files are written to `tmp` beside the executable by default.
+Use `--tmp-dir PATH` to choose another location:
+
+```bash
+./target/release/rusty-k \
+    --input assembly.fa \
+    --output kmers.tsv \
+    --tmp-dir /scratch/rusty-k
+```
+
+Output follows shard order by default. Pass `--sort` to sort the final k-mer
+table lexicographically by k-mer. Sorting uses bounded external runs in the
+temporary directory, so it does not load the complete result table into RAM.
+
 By default, reverse complements are counted together. Use `--canonical false`
 to count each strand separately. `--threads 0` uses all available CPUs; set a
 positive value to choose a worker count.
@@ -27,12 +41,11 @@ distinct k-mers. Plain FASTA is fed in bounded sequence chunks; FASTQ and
 compressed inputs use the parser’s record buffering. `--min-count N` filters
 results while reducing each shard. Adjust the approximate per-shard memory
 budget with `--max-memory-mb`. Temporary shards require free disk space and are
-removed when counting finishes.
+removed when counting finishes. Results are written to a temporary file and
+renamed into place only after counting completes successfully.
 
-Output is TSV with `kmer` and `count` columns, emitted in shard order. Pass
-`--json` for a JSON array instead. Global sorting by count is intentionally not
-performed because it would require retaining or externally sorting the full
-result set.
+Output is TSV with `kmer` and `count` columns. Pass `--json` for a JSON array
+instead. Sorting by count is not performed; `--sort` sorts by k-mer sequence.
 
 K-mer lengths from 1 through 32 are supported. Ambiguous bases split the input
 sequence and are not included in any k-mer.
